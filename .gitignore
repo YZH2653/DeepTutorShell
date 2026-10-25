@@ -1,0 +1,33 @@
+# 依赖
+node_modules/
+
+# 构建产物
+dist/
+src-tauri/target/
+output/
+*.zip
+
+# 本机配置与密钥（绝不入库）
+config.json
+*.local.json
+.env
+.env.*
+
+# 工具目录（体积大，不入库）
+.claude/settings.local.json
+.claude/skills/ui-ux-pro-max/
+.claude/skills/taste-skill/
+.claude/skills/impeccable-skill/
+.claude/skills/planning-with-files/
+.claude/skills/andrej-karpathy-skills/
+
+# DeepTutor 误解析工作区产生的本地数据（不入库）
+data/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.log
+
+# MinerU 解析按 CWD 落的缓存（解析副产物）
+blobs/
