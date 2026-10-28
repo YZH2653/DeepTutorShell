@@ -12,6 +12,11 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const STARTUP_TIMEOUT_SECS: u64 = 60;
 const POLL_INTERVAL_MS: u64 = 500;
 
+// 子进程代理例外（防 Watt Toolkit 等系统代理截胡本地服务）
+pub fn proxy_envs() -> [(&'static str, &'static str); 2] {
+    [("NO_PROXY", "127.0.0.1,localhost"), ("no_proxy", "127.0.0.1,localhost")]
+}
+
 // 拉起的 DeepTutor 服务句柄
 pub struct ServiceHandle {
     pub child: std::process::Child,
@@ -31,6 +36,7 @@ pub struct StatusPayload {
 pub struct ServiceState {
     pub cfg: AppConfig,
     child: Mutex<Option<std::process::Child>>,
+    embed_child: Mutex<Option<std::process::Child>>,
     log_path: Mutex<Option<PathBuf>>,
     generation: AtomicU64,
     stop_guard: AtomicBool,
@@ -42,6 +48,7 @@ impl ServiceState {
         Self {
             cfg,
             child: Mutex::new(None),
+            embed_child: Mutex::new(None),
             log_path: Mutex::new(None),
             generation: AtomicU64::new(0),
             stop_guard: AtomicBool::new(false),
@@ -57,6 +64,14 @@ impl ServiceState {
     // 自拉进程 PID
     pub fn child_pid(&self) -> Option<u32> {
         self.child
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|c| c.id()))
+    }
+
+    // 自拉嵌入服务 PID
+    pub fn embed_child_pid(&self) -> Option<u32> {
+        self.embed_child
             .lock()
             .ok()
             .and_then(|c| c.as_ref().map(|c| c.id()))
@@ -82,15 +97,48 @@ pub fn spawn_service(cfg: &AppConfig) -> std::io::Result<ServiceHandle> {
         .append(true)
         .open(&log_path)?;
     let err = out.try_clone()?;
-    let child = std::process::Command::new(&cfg.deeptutor_exe)
-        .args(["start", "--no-browser", "--home", &cfg.workspace])
+    let mut cmd = std::process::Command::new(&cfg.deeptutor_exe);
+    cmd.args(["start", "--no-browser", "--home", &cfg.workspace])
         .current_dir(&cfg.workspace)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::from(out))
         .stderr(std::process::Stdio::from(err))
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()?;
+        .envs(proxy_envs())
+        .creation_flags(CREATE_NO_WINDOW);
+    let child = cmd.spawn()?;
     Ok(ServiceHandle { child, log_path })
+}
+
+// 联动拉起 BGE-M3 嵌入服务（知识库检索依赖）：
+// 端口已在听=附着不重复拉；脚本缺失=视为未部署不拉；否则拉起并返回句柄
+pub fn spawn_embedding_server(
+    cfg: &AppConfig,
+) -> std::io::Result<Option<(std::process::Child, PathBuf)>> {
+    let e = &cfg.embedding_server;
+    if port_listening(e.port) {
+        return Ok(None);
+    }
+    if !std::path::Path::new(&e.script).exists() {
+        return Ok(None);
+    }
+    let log_path = exe_dir().join("logs").join("embedding-server.log");
+    if let Some(dir) = log_path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let out = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let err = out.try_clone()?;
+    let mut cmd = std::process::Command::new(&e.python);
+    cmd.arg(&e.script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
+        .envs(proxy_envs())
+        .creation_flags(CREATE_NO_WINDOW);
+    let child = cmd.spawn()?;
+    Ok(Some((child, log_path)))
 }
 
 // 端口是否在监听（裸 TCP，不走系统代理）
@@ -135,7 +183,7 @@ pub fn start_coordinator(app: tauri::AppHandle) {
     });
 }
 
-// 探测 → 按需拉起 → 轮询就绪 → 导航到 DeepTutor
+// 探测 → 按需拉起（DeepTutor + 嵌入服务联动）→ 轮询就绪 → 导航到 DeepTutor
 async fn run_coordinator(app: tauri::AppHandle, gen: u64) {
     let cfg = app.state::<ServiceState>().cfg.clone();
     // 已就绪=附着；端口在听=他人启动中；都不通=自行拉起
@@ -146,6 +194,22 @@ async fn run_coordinator(app: tauri::AppHandle, gen: u64) {
     } else {
         "spawn"
     };
+    // v1.1.0.0：嵌入服务（6066）联动——未监听且已部署则拉起；已在听=附着
+    let mut embed_expected = false;
+    match spawn_embedding_server(&cfg) {
+        Ok(Some((child, _embed_log))) => {
+            embed_expected = true;
+            *app.state::<ServiceState>().embed_child.lock().unwrap() = Some(child);
+        }
+        Ok(None) => {
+            // 附着（已监听）或未部署；已监听时无需等待
+            embed_expected = false;
+        }
+        Err(e) => {
+            // 嵌入拉起失败不阻塞主服务，检索会降级为不可用
+            emit_status(&app, "starting", mode, &format!("嵌入服务拉起失败（检索暂不可用）：{e}"), "");
+        }
+    }
     let mut log_path = String::new();
     if mode == "spawn" {
         match spawn_service(&cfg) {
@@ -164,21 +228,39 @@ async fn run_coordinator(app: tauri::AppHandle, gen: u64) {
         log_path = p.to_string_lossy().to_string();
     }
     emit_status(&app, "starting", mode, "", &log_path);
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(STARTUP_TIMEOUT_SECS);
+    // 嵌入服务模型加载慢（1~2 分钟）：期望其就绪时放宽整体就绪窗口
+    let timeout_secs = if embed_expected {
+        cfg.embedding_server.ready_timeout_secs.max(STARTUP_TIMEOUT_SECS)
+    } else {
+        STARTUP_TIMEOUT_SECS
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         // 被 retry 取代则退出
         if app.state::<ServiceState>().generation.load(Ordering::SeqCst) != gen {
             return;
         }
-        if probe_http(cfg.frontend_port) {
+        let fe_ready = probe_http(cfg.frontend_port);
+        let embed_ready = !embed_expected || probe_http(cfg.embedding_server.port);
+        if fe_ready && embed_ready {
             emit_status(&app, "ready", mode, "", &log_path);
             window::navigate_to_frontend(&app, cfg.frontend_port);
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
     }
-    emit_status(&app, "timeout", mode, "服务在 60 秒内未就绪", &log_path);
+    let what = match (probe_http(cfg.frontend_port), embed_expected) {
+        (false, _) => "DeepTutor 服务",
+        (true, true) => "嵌入服务（知识库检索依赖）",
+        (true, false) => "服务",
+    };
+    emit_status(
+        &app,
+        "timeout",
+        mode,
+        &format!("{what}在 {timeout_secs} 秒内未就绪"),
+        &log_path,
+    );
 }
 
 // 发布状态（更新快照 + 通知加载页）
@@ -193,18 +275,25 @@ fn emit_status(app: &tauri::AppHandle, state: &str, mode: &str, message: &str, l
     let _ = app.emit("service:status", payload);
 }
 
-// 关窗即停服务（幂等；阻塞到进程死透，保证端口释放）
+// 关窗即停服务（幂等；阻塞到进程死透，保证端口释放）——含嵌入服务（关掉即干净）
 pub fn stop_service(app: &tauri::AppHandle) {
     let state = app.state::<ServiceState>();
     if state.stop_guard.swap(true, Ordering::SeqCst) {
         return;
     }
-    // 自拉的进程树
+    // 自拉的进程树（DeepTutor + 嵌入服务）
     if let Some(pid) = state.child_pid() {
         taskkill_tree(pid);
     }
+    if let Some(pid) = state.embed_child_pid() {
+        taskkill_tree(pid);
+    }
     // 端口扫尾：覆盖附着模式与孤儿进程
-    let ports = [state.cfg.frontend_port, state.cfg.backend_port];
+    let ports = [
+        state.cfg.frontend_port,
+        state.cfg.backend_port,
+        state.cfg.embedding_server.port,
+    ];
     for pid in pids_listening_on(&ports) {
         taskkill_tree(pid);
     }
@@ -313,28 +402,39 @@ Active Connections\r\n\
         );
     }
 
-    // 本地 TcpListener 模拟就绪/未就绪
+    // v1.1.0.0：子进程代理例外（NO_PROXY 双写大小写）
     #[test]
-    fn probe_http_accepts_3xx() {
+    fn proxy_envs_shape() {
+        let e = proxy_envs();
+        assert_eq!(e[0], ("NO_PROXY", "127.0.0.1,localhost"));
+        assert_eq!(e[1], ("no_proxy", "127.0.0.1,localhost"));
+    }
+
+    // 本地 TcpListener 模拟就绪/未就绪
+    // 注意：服务端必须先读完请求再写响应——否则 close 时未读数据触发 RST，会把响应冲掉
+    fn serve_status(status_line: &'static str) -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((mut s, _)) = listener.accept() {
-                let _ = s.write_all(b"HTTP/1.1 307 Temporary Redirect\r\n\r\n");
+                let mut req = [0u8; 256];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(status_line.as_bytes());
+                let _ = s.shutdown(std::net::Shutdown::Write);
             }
         });
+        port
+    }
+
+    #[test]
+    fn probe_http_accepts_3xx() {
+        let port = serve_status("HTTP/1.1 307 Temporary Redirect\r\n\r\n");
         assert!(probe_http(port));
     }
 
     #[test]
     fn probe_http_rejects_5xx() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut s, _)) = listener.accept() {
-                let _ = s.write_all(b"HTTP/1.1 500 Internal Server Error\r\n\r\n");
-            }
-        });
+        let port = serve_status("HTTP/1.1 500 Internal Server Error\r\n\r\n");
         assert!(!probe_http(port));
     }
 

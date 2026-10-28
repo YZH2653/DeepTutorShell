@@ -6,6 +6,31 @@ pub const DEFAULT_DEEPTUTOR_EXE: &str = r"E:\DeepTutor\.venv\Scripts\deeptutor.e
 pub const DEFAULT_WORKSPACE: &str = r"E:\DeepTutor\dt-home";
 pub const DEFAULT_FRONTEND_PORT: u16 = 3782;
 pub const DEFAULT_BACKEND_PORT: u16 = 8001;
+// BGE-M3 本地嵌入服务（知识库检索依赖；v1.1.0.0 起与 DeepTutor 联动拉起）
+pub const DEFAULT_EMBED_PYTHON: &str = r"E:\DeepTutor\.venv\Scripts\python.exe";
+pub const DEFAULT_EMBED_SCRIPT: &str = r"E:\BGE-M3\serve_bge_m3.py";
+pub const DEFAULT_EMBED_PORT: u16 = 6066;
+
+// 嵌入服务子配置（python + 脚本 + 端口；模型加载慢，就绪超时单独放宽）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmbeddingServerConfig {
+    pub python: String,
+    pub script: String,
+    pub port: u16,
+    pub ready_timeout_secs: u64,
+}
+
+impl Default for EmbeddingServerConfig {
+    fn default() -> Self {
+        Self {
+            python: DEFAULT_EMBED_PYTHON.to_string(),
+            script: DEFAULT_EMBED_SCRIPT.to_string(),
+            port: DEFAULT_EMBED_PORT,
+            ready_timeout_secs: 150,
+        }
+    }
+}
 
 // 壳配置（exe 旁 config.json，缺文件用默认值）
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -15,6 +40,7 @@ pub struct AppConfig {
     pub workspace: String,
     pub frontend_port: u16,
     pub backend_port: u16,
+    pub embedding_server: EmbeddingServerConfig,
 }
 
 impl Default for AppConfig {
@@ -24,6 +50,7 @@ impl Default for AppConfig {
             workspace: DEFAULT_WORKSPACE.to_string(),
             frontend_port: DEFAULT_FRONTEND_PORT,
             backend_port: DEFAULT_BACKEND_PORT,
+            embedding_server: EmbeddingServerConfig::default(),
         }
     }
 }
@@ -59,6 +86,26 @@ mod tests {
         assert_eq!(c.workspace, r"E:\DeepTutor\dt-home");
         assert_eq!(c.frontend_port, 3782);
         assert_eq!(c.backend_port, 8001);
+    }
+
+    // v1.1.0.0：嵌入服务默认值（BGE-M3）
+    #[test]
+    fn embedding_defaults() {
+        let e = AppConfig::default().embedding_server;
+        assert_eq!(e.python, r"E:\DeepTutor\.venv\Scripts\python.exe");
+        assert_eq!(e.script, r"E:\BGE-M3\serve_bge_m3.py");
+        assert_eq!(e.port, 6066);
+        assert_eq!(e.ready_timeout_secs, 150);
+    }
+
+    // 嵌入配置部分字段覆盖、其余回默认
+    #[test]
+    fn embedding_partial_override() {
+        let c: AppConfig =
+            serde_json::from_str(r#"{"embedding_server":{"port":7000}}"#).unwrap();
+        assert_eq!(c.embedding_server.port, 7000);
+        assert_eq!(c.embedding_server.ready_timeout_secs, 150);
+        assert_eq!(c.embedding_server.script, DEFAULT_EMBED_SCRIPT);
     }
 
     #[test]

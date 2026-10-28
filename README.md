@@ -10,6 +10,7 @@
 - **启动过渡页**：内置加载页 + 进度提示；60 秒未就绪显示排障面板（日志/重试）
 - **独立窗口**：webview 直接导航到本地服务，无地址栏、任务栏独立图标；导航白名单限本机端口，外链自动转系统浏览器
 - **关窗即走**：关闭窗口 = 退出并停止 DeepTutor 服务（进程树清理 + 端口扫尾，`netstat` 立即干净）
+- **嵌入服务联动（v1.1.0.0）**：自动拉起本地 BGE-M3 嵌入服务（知识库检索依赖，默认端口 6066），关窗一并停止；嵌入服务未部署时自动跳过
 - **单实例**：重复双击只唤起已有窗口
 - **便携配置**：exe 旁可放 `config.json` 覆盖 CLI 路径/工作区/端口，缺省用默认值
 
@@ -38,7 +39,13 @@ exe 旁 `config.json`：
   "deeptutor_exe": "E:\\DeepTutor\\.venv\\Scripts\\deeptutor.exe",
   "workspace": "E:\\DeepTutor\\dt-home",
   "frontend_port": 3782,
-  "backend_port": 8001
+  "backend_port": 8001,
+  "embedding_server": {
+    "python": "E:\\DeepTutor\\.venv\\Scripts\\python.exe",
+    "script": "E:\\BGE-M3\\serve_bge_m3.py",
+    "port": 6066,
+    "ready_timeout_secs": 150
+  }
 }
 ```
 
